@@ -2,7 +2,6 @@ package database
 
 import (
 	"database/sql"
-	"os"
 
 	"github.com/TheWanderingShinobi/gopher-cli-manager/pkg/models"
 	_ "github.com/mattn/go-sqlite3"

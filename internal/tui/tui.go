@@ -18,20 +18,23 @@ var (
 )
 
 type model struct {
-	db           *database.DB
-	state        string
-	list         list.Model
-	inputs       []textinput.Model
-	selectedCLI  models.Cli
-	err          error
-	confirmState string
+	db             *database.DB
+	state          string
+	list           list.Model
+	inputs         []textinput.Model
+	selectedCLI    models.Cli
+	err            error
+	confirmState   string
+	successMessage string
 }
 
 func initialModel(db *database.DB) model {
 	return model{
-		db:    db,
-		state: "menu",
-		list:  list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0),
+		db:             db,
+		state:          "menu",
+		list:           list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0),
+		err:            nil,
+		successMessage: "",
 	}
 }
 
@@ -51,10 +54,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return handleFormInput(m, msg)
 		case "confirm":
 			return handleConfirmInput(m, msg)
+		case "search":
+			return handleSearchInput(m, msg)
 		}
 	case tea.WindowSizeMsg:
 		m.list.SetWidth(msg.Width)
 		m.list.SetHeight(msg.Height - 4)
+		return m, nil
+	case errMsg:
+		m.err = fmt.Errorf(string(msg))
+		return m, nil
+	case successMsg:
+		m.successMessage = string(msg)
 		return m, nil
 	}
 
@@ -64,18 +75,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	var content string
+
 	switch m.state {
 	case "menu":
-		return appStyle.Render(m.viewMenu())
+		content = m.viewMenu()
 	case "list":
-		return appStyle.Render(m.list.View())
+		content = m.list.View()
 	case "add", "edit":
-		return appStyle.Render(m.viewForm())
+		content = m.viewForm()
 	case "confirm":
-		return appStyle.Render(m.viewConfirm())
+		content = m.viewConfirm()
+	case "search":
+		content = m.viewSearch()
 	default:
-		return "Error: Unknown state"
+		content = "Error: Unknown state"
 	}
+
+	if m.err != nil {
+		content += "\n\nError: " + m.err.Error()
+	}
+
+	if m.successMessage != "" {
+		content += "\n\nSuccess: " + m.successMessage
+	}
+
+	return appStyle.Render(content)
 }
 
 func (m model) viewMenu() string {
@@ -104,6 +129,10 @@ func (m model) viewForm() string {
 
 func (m model) viewConfirm() string {
 	return fmt.Sprintf("%s\n\nPress y to confirm, n to cancel", m.confirmState)
+}
+
+func (m model) viewSearch() string {
+	return fmt.Sprintf("Search CLIs\n\n%s\n\nPress Enter to search, Esc to cancel", m.inputs[0].View())
 }
 
 func handleMenuInput(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -142,6 +171,14 @@ func handleListInput(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func handleFormInput(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	current := -1
+	for i, input := range m.inputs {
+		if input.Focused() {
+			current = i
+			break
+		}
+	}
+
 	switch msg.Type {
 	case tea.KeyEnter:
 		if m.state == "add" {
@@ -151,6 +188,16 @@ func handleFormInput(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case tea.KeyEsc:
 		return initialModel(m.db), nil
+	case tea.KeyUp, tea.KeyShiftTab:
+		if current > 0 {
+			m.inputs[current].Blur()
+			m.inputs[current-1].Focus()
+		}
+	case tea.KeyDown, tea.KeyTab:
+		if current < len(m.inputs)-1 {
+			m.inputs[current].Blur()
+			m.inputs[current+1].Focus()
+		}
 	}
 
 	var cmd tea.Cmd
@@ -164,29 +211,61 @@ func handleConfirmInput(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y":
 		if m.confirmState == "Are you sure you want to delete ALL the CLIs?" {
-			m.db.DeleteAllRecords()
+			err := m.db.DeleteAllRecords()
+			if err != nil {
+				return m, showErrorMsg(fmt.Sprintf("Failed to delete all records: %v", err))
+			}
+			return initialModel(m.db), showSuccessMsg("All CLIs deleted successfully")
 		} else {
-			m.db.DeleteRecordById(m.selectedCLI.Id)
+			err := m.db.DeleteRecordById(m.selectedCLI.Id)
+			if err != nil {
+				return m, showErrorMsg(fmt.Sprintf("Failed to delete CLI: %v", err))
+			}
+			return initialModel(m.db), showSuccessMsg(fmt.Sprintf("CLI '%s' deleted successfully", m.selectedCLI.Name))
 		}
-		return initialModel(m.db), nil
 	case "n":
 		return initialModel(m.db), nil
 	}
 	return m, nil
 }
 
+func handleSearchInput(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		return showCLIList(m, m.inputs[0].Value())
+	case tea.KeyEsc:
+		return initialModel(m.db), nil
+	}
+
+	var cmd tea.Cmd
+	m.inputs[0], cmd = m.inputs[0].Update(msg)
+	return m, cmd
+}
+
 func showCLIList(m model, search string) (tea.Model, tea.Cmd) {
-	items := []list.Item{}
 	clis, err := m.db.GetEntriesContainingText(search)
 	if err != nil {
-		m.err = err
-		return m, nil
+		return m, showErrorMsg(fmt.Sprintf("Failed to fetch CLIs: %v", err))
 	}
-	for _, cli := range clis {
-		items = append(items, cliItem{cli: cli})
+
+	items := make([]list.Item, len(clis))
+	for i, cli := range clis {
+		items[i] = cliItem{cli: cli}
 	}
+
 	m.list.SetItems(items)
 	m.state = "list"
+
+	// Debug logging
+	fmt.Printf("Fetched %d CLIs\n", len(clis))
+	for _, cli := range clis {
+		fmt.Printf("CLI: %+v\n", cli)
+	}
+
+	if len(items) == 0 {
+		return m, showErrorMsg("No CLIs found")
+	}
+
 	return m, nil
 }
 
@@ -206,6 +285,7 @@ func initAddForm(m model) (tea.Model, tea.Cmd) {
 		switch i {
 		case 0:
 			t.Placeholder = "Name"
+			t.Focus()
 		case 1:
 			t.Placeholder = "Description"
 		case 2:
@@ -213,9 +293,8 @@ func initAddForm(m model) (tea.Model, tea.Cmd) {
 		}
 		m.inputs[i] = t
 	}
-	m.inputs[0].Focus()
 	m.state = "add"
-	return m, textinput.Blink
+	return m, nil
 }
 
 func saveCLI(m model) (tea.Model, tea.Cmd) {
@@ -224,35 +303,77 @@ func saveCLI(m model) (tea.Model, tea.Cmd) {
 		Description: m.inputs[1].Value(),
 		Path:        m.inputs[2].Value(),
 	}
+
+	if cli.Name == "" || cli.Description == "" || cli.Path == "" {
+		return m, showErrorMsg("All fields must be filled")
+	}
+
 	err := m.db.CreateCli(cli)
 	if err != nil {
-		m.err = err
-		return m, nil
+		return m, showErrorMsg(fmt.Sprintf("Failed to save CLI: %v", err))
 	}
-	return initialModel(m.db), nil
+
+	return initialModel(m.db), showSuccessMsg(fmt.Sprintf("CLI '%s' saved successfully", cli.Name))
 }
 
 func updateCLI(m model) (tea.Model, tea.Cmd) {
 	m.selectedCLI.Name = m.inputs[0].Value()
 	m.selectedCLI.Description = m.inputs[1].Value()
 	m.selectedCLI.Path = m.inputs[2].Value()
+
+	if m.selectedCLI.Name == "" || m.selectedCLI.Description == "" || m.selectedCLI.Path == "" {
+		return m, showErrorMsg("All fields must be filled")
+	}
+
 	err := m.db.UpdateCli(m.selectedCLI)
 	if err != nil {
-		m.err = err
-		return m, nil
+		return m, showErrorMsg(fmt.Sprintf("Failed to update CLI: %v", err))
 	}
-	return initialModel(m.db), nil
+
+	return initialModel(m.db), showSuccessMsg(fmt.Sprintf("CLI '%s' updated successfully", m.selectedCLI.Name))
 }
 
 func showCLIActions(m model) (tea.Model, tea.Cmd) {
 	items := []list.Item{
-		cliActionItem{name: "Delete"},
-		cliActionItem{name: "Edit"},
-		cliActionItem{name: "Copy path to clipboard"},
-		cliActionItem{name: "Back to menu"},
+		cliActionItem{name: "Delete", action: deleteCLIAction},
+		cliActionItem{name: "Edit", action: editCLIAction},
+		cliActionItem{name: "Copy path to clipboard", action: copyCLIPathAction},
+		cliActionItem{name: "Back to menu", action: backToMenuAction},
 	}
 	m.list.SetItems(items)
+	m.state = "list"
 	return m, nil
+}
+
+func deleteCLIAction(m model) (tea.Model, tea.Cmd) {
+	m.state = "confirm"
+	m.confirmState = fmt.Sprintf("Are you sure you want to delete the CLI '%s'?", m.selectedCLI.Name)
+	return m, nil
+}
+
+func editCLIAction(m model) (tea.Model, tea.Cmd) {
+	m.state = "edit"
+	m.inputs = make([]textinput.Model, 3)
+	m.inputs[0] = textinput.New()
+	m.inputs[0].SetValue(m.selectedCLI.Name)
+	m.inputs[0].Focus()
+	m.inputs[1] = textinput.New()
+	m.inputs[1].SetValue(m.selectedCLI.Description)
+	m.inputs[2] = textinput.New()
+	m.inputs[2].SetValue(m.selectedCLI.Path)
+	return m, nil
+}
+
+func copyCLIPathAction(m model) (tea.Model, tea.Cmd) {
+	err := clipboard.WriteAll(m.selectedCLI.Path)
+	if err != nil {
+		return m, showErrorMsg(fmt.Sprintf("Failed to copy path to clipboard: %v", err))
+	}
+	return initialModel(m.db), showSuccessMsg(fmt.Sprintf("Path for CLI '%s' copied to clipboard", m.selectedCLI.Name))
+}
+
+func backToMenuAction(m model) (tea.Model, tea.Cmd) {
+	return initialModel(m.db), nil
 }
 
 type cliItem struct {
@@ -264,12 +385,28 @@ func (i cliItem) Description() string { return i.cli.Description }
 func (i cliItem) FilterValue() string { return i.cli.Name }
 
 type cliActionItem struct {
-	name string
+	name   string
+	action func(model) (tea.Model, tea.Cmd)
 }
 
 func (i cliActionItem) Title() string       { return i.name }
 func (i cliActionItem) Description() string { return "" }
 func (i cliActionItem) FilterValue() string { return i.name }
+
+func showErrorMsg(msg string) tea.Cmd {
+	return func() tea.Msg {
+		return errMsg(msg)
+	}
+}
+
+func showSuccessMsg(msg string) tea.Cmd {
+	return func() tea.Msg {
+		return successMsg(msg)
+	}
+}
+
+type errMsg string
+type successMsg string
 
 func StartTea(db *database.DB) {
 	p := tea.NewProgram(initialModel(db))
@@ -277,3 +414,4 @@ func StartTea(db *database.DB) {
 		fmt.Println("Error running program:", err)
 	}
 }
+
